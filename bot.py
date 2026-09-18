@@ -106,6 +106,30 @@ def category_keyboard():
     ])
 
 
+def back_to_categories_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="back_categories"
+            )
+        ]
+    ])
+
+async def back_to_categories(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "🎬 Welcome to StreamX!\n\n"
+        "একটি category নির্বাচন করো:",
+        reply_markup=category_keyboard()
+    )
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
@@ -244,8 +268,9 @@ async def category_callback(
         return
 
     await query.edit_message_text(
-        f"{CATEGORIES[category]}\n\n"
-        "নিচের video-গুলো থেকে একটি নির্বাচন করো:"
+    f"{CATEGORIES[category]}\n\n"
+    "নিচের video-গুলো থেকে একটি নির্বাচন করো:",
+    reply_markup=back_to_categories_keyboard()
     )
 
     for content_id, title, thumbnail in rows:
@@ -601,6 +626,14 @@ def run_bot():
             category_callback,
             pattern=r"^cat_"
         )
+    )
+
+    # back to categories
+    application.add_handler(
+    CallbackQueryHandler(
+        back_to_categories,
+        pattern=r"^back_categories$"
+       )
     )
 
     # open video
