@@ -1,31 +1,40 @@
+import os
 import sqlite3
-from datetime import datetime
+import secrets
+import threading
+import time
+import asyncio
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from flask import Flask
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
     filters,
 )
 
-# =========================================================
-# SETTINGS
-# =========================================================
+# =====================================================
+# CONFIG
+# =====================================================
 
-BOT_TOKEN = "8352992151:AAE2Y6soETifFAjizXsPBblj2vff00-exkQ"
-
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = 6235831075
 
 DATABASE = "content.db"
 
-# Hosting করার পর এখানে তোমার public HTTPS URL বসাবে
-# Example:
-# WEB_APP_URL = "https://streamx-video.onrender.com"
 WEB_APP_URL = "https://streamx-u24j.onrender.com"
 
+# =====================================================
+# CATEGORIES
+# =====================================================
 
 CATEGORIES = {
     "bangla": "🇧🇩 Bangla",
@@ -34,63 +43,472 @@ CATEGORIES = {
     "trending": "📈 Trending",
 }
 
+# =====================================================
+# ADD STATES
+# =====================================================
 
-# =========================================================
+ADD_CATEGORY, ADD_TITLE, ADD_THUMBNAIL, ADD_VIDEO, ADD_AD_URL = range(5)
+
+# =====================================================
 # DATABASE
-# =========================================================
+# =====================================================
 
-def db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+def db_connect():
+    conn = sqlite3.connect(DATABASE, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
 def init_db():
-
-    conn = db()
+    conn = db_connect()
 
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS contents (
+        CREATE TABLE IF NOT EXISTS content (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT NOT NULL,
             title TEXT NOT NULL,
             thumbnail_file_id TEXT,
             video_file_id TEXT NOT NULL,
-            ad_url TEXT,
-            created_at TEXT NOT NULL
+            ad_url TEXT NOT NULL,
+            created_at INTEGER NOT NULL
         )
     """)
 
-    columns = [
-        row["name"]
-        for row in conn.execute(
-            "PRAGMA table_info(contents)"
-        ).fetchall()
-    ]
-
-    if "ad_url" not in columns:
-
-        conn.execute(
-            "ALTER TABLE contents ADD COLUMN ad_url TEXT"
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS access_tokens (
+            token TEXT PRIMARY KEY,
+            content_id INTEGER NOT NULL,
+            ad_clicked INTEGER DEFAULT 0,
+            used INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            unlocked_at INTEGER DEFAULT 0
         )
+    """)
 
     conn.commit()
     conn.close()
 
 
-def add_content(
-    category,
-    title,
-    thumbnail_file_id,
-    video_file_id,
-    ad_url
+# =====================================================
+# MAIN MENU
+# =====================================================
+
+def category_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🇧🇩 Bangla", callback_data="cat_bangla"),
+            InlineKeyboardButton("🇬🇧 English", callback_data="cat_english"),
+        ],
+        [
+            InlineKeyboardButton("🔥 Viral", callback_data="cat_viral"),
+            InlineKeyboardButton("📈 Trending", callback_data="cat_trending"),
+        ],
+    ])
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    args = context.args
+
+    # -------------------------------------------------
+    # VIDEO DEEP LINK
+    # -------------------------------------------------
+
+    if args and args[0].startswith("video_"):
+
+        token = args[0][6:]
+
+        conn = db_connect()
+
+        row = conn.execute("""
+            SELECT content_id, ad_clicked, used, created_at
+            FROM access_tokens
+            WHERE token = ?
+        """, (token,)).fetchone()
+
+        if not row:
+            conn.close()
+
+            await update.message.reply_text(
+                "❌ এই video link আর valid নেই।"
+            )
+            return
+
+        content_id, ad_clicked, used, created_at = row
+
+        # 30 minute expiry
+        if time.time() - created_at > 30 * 60:
+            conn.execute(
+                "DELETE FROM access_tokens WHERE token = ?",
+                (token,)
+            )
+            conn.commit()
+            conn.close()
+
+            await update.message.reply_text(
+                "⏰ এই video link-এর সময় শেষ হয়ে গেছে।"
+            )
+            return
+
+        if not ad_clicked:
+            conn.close()
+
+            await update.message.reply_text(
+                "⚠️ আগে advertisement step complete করো।"
+            )
+            return
+
+        if used:
+            conn.close()
+
+            await update.message.reply_text(
+                "⚠️ এই link ইতিমধ্যে ব্যবহার করা হয়েছে।"
+            )
+            return
+
+        # Mark one-time deep link as used
+        conn.execute("""
+            UPDATE access_tokens
+            SET used = 1,
+                unlocked_at = ?
+            WHERE token = ?
+        """, (int(time.time()), token))
+
+        conn.commit()
+        conn.close()
+
+        video_url = (
+            WEB_APP_URL.rstrip("/")
+            + f"/video/{token}"
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "▶️ WATCH VIDEO",
+                    url=video_url
+                )
+            ]
+        ])
+
+        await update.message.reply_text(
+            "✅ Video unlocked!\n\n"
+            "নিচের button চাপলে browser-এ video player খুলবে:",
+            reply_markup=keyboard
+        )
+
+        return
+
+    # -------------------------------------------------
+    # NORMAL START
+    # -------------------------------------------------
+
+    await update.message.reply_text(
+        "🎬 Welcome to StreamX!\n\n"
+        "একটি category নির্বাচন করো:",
+        reply_markup=category_keyboard()
+    )
+
+
+# =====================================================
+# CATEGORY BUTTON
+# =====================================================
+
+async def category_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    conn = db()
+    query = update.callback_query
+    await query.answer()
 
-    cur = conn.execute(
-        """
-        INSERT INTO contents
+    category = query.data.replace("cat_", "")
+
+    conn = db_connect()
+
+    rows = conn.execute("""
+        SELECT id, title, thumbnail_file_id
+        FROM content
+        WHERE category = ?
+        ORDER BY id DESC
+    """, (category,)).fetchall()
+
+    conn.close()
+
+    if not rows:
+        await query.edit_message_text(
+            f"{CATEGORIES[category]}\n\n"
+            "এই category-তে এখনো কোনো video নেই।",
+            reply_markup=category_keyboard()
+        )
+        return
+
+    await query.edit_message_text(
+        f"{CATEGORIES[category]}\n\n"
+        "নিচের video-গুলো থেকে একটি নির্বাচন করো:"
+    )
+
+    for content_id, title, thumbnail in rows:
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "▶️ OPEN VIDEO",
+                    callback_data=f"open_{content_id}"
+                )
+            ]
+        ])
+
+        text = f"🎬 {title}"
+
+        try:
+            if thumbnail:
+                await context.bot.send_photo(
+                    chat_id=query.message.chat_id,
+                    photo=thumbnail,
+                    caption=text,
+                    reply_markup=keyboard
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=text,
+                    reply_markup=keyboard
+                )
+
+        except Exception:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=text,
+                reply_markup=keyboard
+            )
+
+
+# =====================================================
+# OPEN VIDEO
+# =====================================================
+
+async def open_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    content_id = int(query.data.replace("open_", ""))
+
+    conn = db_connect()
+
+    row = conn.execute("""
+        SELECT title, ad_url
+        FROM content
+        WHERE id = ?
+    """, (content_id,)).fetchone()
+
+    conn.close()
+
+    if not row:
+        await query.message.reply_text(
+            "❌ Video পাওয়া যায়নি।"
+        )
+        return
+
+    title, ad_url = row
+
+    if not ad_url:
+        await query.message.reply_text(
+            "⚠️ এই video-তে advertisement সেট করা হয়নি।"
+        )
+        return
+
+    if not WEB_APP_URL.startswith("https://"):
+        await query.message.reply_text(
+            "⚠️ Website URL configure করা হয়নি।"
+        )
+        return
+
+    watch_url = (
+        WEB_APP_URL.rstrip("/")
+        + f"/watch/{content_id}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📢 WATCH AD & UNLOCK",
+                url=watch_url
+            )
+        ]
+    ])
+
+    await query.message.reply_text(
+        f"🎬 {title}\n\n"
+        "Video দেখতে আগে নিচের button চাপো।\n"
+        "Advertisement page খুলবে।",
+        reply_markup=keyboard
+    )
+
+
+# =====================================================
+# ADMIN: /add
+# =====================================================
+
+async def add_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text(
+            "❌ এই command শুধু admin-এর জন্য।"
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "📂 Video category নির্বাচন করো:",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🇧🇩 Bangla",
+                    callback_data="addcat_bangla"
+                ),
+                InlineKeyboardButton(
+                    "🇬🇧 English",
+                    callback_data="addcat_english"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔥 Viral",
+                    callback_data="addcat_viral"
+                ),
+                InlineKeyboardButton(
+                    "📈 Trending",
+                    callback_data="addcat_trending"
+                ),
+            ],
+        ])
+    )
+
+    return ADD_CATEGORY
+
+
+async def add_category(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    category = query.data.replace("addcat_", "")
+
+    context.user_data["add_category"] = category
+
+    await query.message.reply_text(
+        "✏️ এখন video-এর title পাঠাও:"
+    )
+
+    return ADD_TITLE
+
+
+async def add_title(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    context.user_data["add_title"] = update.message.text.strip()
+
+    await update.message.reply_text(
+        "🖼️ এখন thumbnail/photo পাঠাও।\n\n"
+        "Thumbnail দিতে না চাইলে `/skip` লিখো।"
+    )
+
+    return ADD_THUMBNAIL
+
+
+async def add_thumbnail(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if update.message.text and update.message.text.strip() == "/skip":
+
+        context.user_data["add_thumbnail"] = None
+
+    elif update.message.photo:
+
+        context.user_data["add_thumbnail"] = (
+            update.message.photo[-1].file_id
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "⚠️ একটি photo পাঠাও অথবা `/skip` লিখো।"
+        )
+
+        return ADD_THUMBNAIL
+
+    await update.message.reply_text(
+        "🎥 এখন video পাঠাও বা তোমার private channel থেকে "
+        "video post-টি forward করো।"
+    )
+
+    return ADD_VIDEO
+
+
+async def add_video(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message.video:
+
+        await update.message.reply_text(
+            "⚠️ Video message পাঠাও।"
+        )
+
+        return ADD_VIDEO
+
+    context.user_data["add_video"] = (
+        update.message.video.file_id
+    )
+
+    await update.message.reply_text(
+        "🔗 এখন Adsterra SmartLink URL পাঠাও:\n\n"
+        "উদাহরণ:\n"
+        "https://example.com/..."
+    )
+
+    return ADD_AD_URL
+
+
+async def add_ad_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    ad_url = update.message.text.strip()
+
+    if not ad_url.startswith(("http://", "https://")):
+
+        await update.message.reply_text(
+            "⚠️ সঠিক URL পাঠাও।"
+        )
+
+        return ADD_AD_URL
+
+    category = context.user_data["add_category"]
+    title = context.user_data["add_title"]
+    thumbnail = context.user_data.get("add_thumbnail")
+    video_file_id = context.user_data["add_video"]
+
+    conn = db_connect()
+
+    conn.execute("""
+        INSERT INTO content
         (
             category,
             title,
@@ -100,815 +518,171 @@ def add_content(
             created_at
         )
         VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            category,
-            title,
-            thumbnail_file_id,
-            video_file_id,
-            ad_url,
-            datetime.utcnow().isoformat(),
-        )
-    )
-
-    content_id = cur.lastrowid
+    """, (
+        category,
+        title,
+        thumbnail,
+        video_file_id,
+        ad_url,
+        int(time.time())
+    ))
 
     conn.commit()
     conn.close()
 
-    return content_id
-
-
-def get_content(content_id):
-
-    conn = db()
-
-    row = conn.execute(
-        """
-        SELECT *
-        FROM contents
-        WHERE id = ?
-        """,
-        (content_id,)
-    ).fetchone()
-
-    conn.close()
-
-    return row
-
-
-def get_category_contents(category):
-
-    conn = db()
-
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM contents
-        WHERE category = ?
-        ORDER BY id DESC
-        """,
-        (category,)
-    ).fetchall()
-
-    conn.close()
-
-    return rows
-
-
-# =========================================================
-# CATEGORY MENU
-# =========================================================
-
-def category_keyboard():
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🇧🇩 Bangla",
-                callback_data="cat_bangla"
-            ),
-            InlineKeyboardButton(
-                "🇬🇧 English",
-                callback_data="cat_english"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🔥 Viral",
-                callback_data="cat_viral"
-            ),
-            InlineKeyboardButton(
-                "📈 Trending",
-                callback_data="cat_trending"
-            ),
-        ]
-    ])
-
-
-# =========================================================
-# START
-# =========================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    # Web page থেকে ফেরত আসা video token
-    if context.args:
-
-        payload = context.args[0]
-
-        if payload.startswith("video_"):
-
-            token = payload[6:]
-
-            await send_unlocked_video(
-                update,
-                token
-            )
-
-            return
+    context.user_data.clear()
 
     await update.message.reply_text(
-        "🎬 Welcome to StreamX!\n\n"
-        "Choose a category:",
-        reply_markup=category_keyboard()
+        "✅ Video successfully added!\n\n"
+        f"📂 Category: {CATEGORIES[category]}\n"
+        f"🎬 Title: {title}"
     )
 
+    return ConversationHandler.END
 
-# =========================================================
-# CATEGORY
-# =========================================================
 
-async def category_callback(
+async def cancel_add(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    query = update.callback_query
-
-    await query.answer()
-
-    category = query.data.replace(
-        "cat_",
-        "",
-        1
-    )
-
-    rows = get_category_contents(
-        category
-    )
-
-    if not rows:
-
-        await query.message.reply_text(
-            f"😔 No videos found in "
-            f"{CATEGORIES.get(category, category)}."
-        )
-
-        return
-
-    await query.message.reply_text(
-        f"{CATEGORIES.get(category, category)}\n\n"
-        "Select a video:"
-    )
-
-    for row in rows:
-
-        title = row["title"]
-
-        thumbnail = row["thumbnail_file_id"]
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "▶️ OPEN VIDEO",
-                    callback_data=f"open_video_{row['id']}"
-                )
-            ]
-        ])
-
-        if thumbnail:
-
-            try:
-
-                await query.message.reply_photo(
-                    photo=thumbnail,
-                    caption=f"🎬 {title}",
-                    reply_markup=keyboard
-                )
-
-                continue
-
-            except Exception:
-
-                pass
-
-        await query.message.reply_text(
-            f"🎬 {title}",
-            reply_markup=keyboard
-        )
-
-
-# =========================================================
-# OPEN VIDEO
-# =========================================================
-
-async def open_video(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    try:
-
-        content_id = int(
-            query.data.replace(
-                "open_video_",
-                "",
-                1
-            )
-        )
-
-    except ValueError:
-
-        await query.message.reply_text(
-            "❌ Invalid video."
-        )
-
-        return
-
-    row = get_content(
-        content_id
-    )
-
-    if not row:
-
-        await query.message.reply_text(
-            "❌ Video not found."
-        )
-
-        return
-
-    ad_url = (
-        row["ad_url"] or ""
-    ).strip()
-
-    # =====================================================
-    # AD PAGE
-    # =====================================================
-
-    if (
-        ad_url
-        and WEB_APP_URL.startswith("https://")
-        and "YOUR-DOMAIN-HERE" not in WEB_APP_URL
-    ):
-
-        watch_url = (
-            WEB_APP_URL.rstrip("/")
-            + f"/watch/{content_id}"
-        )
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "📢 WATCH AD & UNLOCK",
-                    url=watch_url
-                )
-            ]
-        ])
-
-        await query.message.reply_text(
-            f"🎬 {row['title']}\n\n"
-            "🔒 Advertisement required.\n\n"
-            "Click the button below to open "
-            "the advertisement page.",
-            reply_markup=keyboard
-        )
-
-        return
-
-    # =====================================================
-    # NO AD
-    # =====================================================
-
-    if not ad_url:
-
-        await query.message.reply_text(
-            "⚠️ Advertisement is not configured "
-            "for this video yet."
-        )
-
-        return
-
-    # =====================================================
-    # WEB URL NOT CONFIGURED
-    # =====================================================
-
-    await query.message.reply_text(
-        "⚠️ Video website is not configured.\n\n"
-        "Admin: set WEB_APP_URL in bot.py."
-    )
-
-
-# =========================================================
-# SEND UNLOCKED VIDEO
-# =========================================================
-
-async def send_unlocked_video(
-    update: Update,
-    token: str
-):
-
-    conn = db()
-
-    row = conn.execute(
-        """
-        SELECT
-            ad_tokens.token,
-            ad_tokens.content_id,
-            ad_tokens.ad_clicked,
-            ad_tokens.unlocked,
-            ad_tokens.expires_at,
-            ad_tokens.used,
-            contents.title
-
-        FROM ad_tokens
-
-        JOIN contents
-        ON contents.id = ad_tokens.content_id
-
-        WHERE ad_tokens.token = ?
-        """,
-        (token,)
-    ).fetchone()
-
-    if not row:
-
-        conn.close()
-
-        await update.message.reply_text(
-            "❌ Invalid or expired video link."
-        )
-
-        return
-
-    now = datetime.utcnow().timestamp()
-
-    try:
-
-        expires_at = float(
-            row["expires_at"]
-        )
-
-    except Exception:
-
-        expires_at = 0
-
-    # =====================================================
-    # USED
-    # =====================================================
-
-    if row["used"]:
-
-        conn.close()
-
-        await update.message.reply_text(
-            "⚠️ This video link has already been used."
-        )
-
-        return
-
-    # =====================================================
-    # EXPIRED
-    # =====================================================
-
-    if expires_at < now:
-
-        conn.close()
-
-        await update.message.reply_text(
-            "⏰ This session has expired.\n\n"
-            "Please select the video again."
-        )
-
-        return
-
-    # =====================================================
-    # NOT UNLOCKED
-    # =====================================================
-
-    if not row["ad_clicked"] or not row["unlocked"]:
-
-        conn.close()
-
-        await update.message.reply_text(
-            "🔒 Advertisement step is not completed."
-        )
-
-        return
-
-    # =====================================================
-    # ONE TIME TOKEN
-    # =====================================================
-
-    conn.execute(
-        """
-        UPDATE ad_tokens
-        SET used = 1
-        WHERE token = ?
-        """,
-        (token,)
-    )
-
-    conn.commit()
-
-    conn.close()
-
-    # =====================================================
-    # VIDEO PLAYER PAGE
-    # =====================================================
-
-    player_url = (
-        WEB_APP_URL.rstrip("/")
-        + f"/video/{token}"
-    )
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "▶️ WATCH VIDEO",
-                url=player_url
-            )
-        ]
-    ])
+    context.user_data.clear()
 
     await update.message.reply_text(
-        f"✅ Unlocked!\n\n"
-        f"🎬 {row['title']}\n\n"
-        "Open the video player:",
-        reply_markup=keyboard
+        "❌ Add process cancelled."
+    )
+
+    return ConversationHandler.END
+
+
+# =====================================================
+# START FLASK SERVER
+# =====================================================
+
+def start_web_server():
+
+    from app import app
+
+    port = int(os.environ.get("PORT", "8080"))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True,
+        use_reloader=False
     )
 
 
-# =========================================================
-# ADMIN ADD
-# =========================================================
+# =====================================================
+# BOT
+# =====================================================
 
-async def add_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+def run_bot():
 
-    if update.effective_user.id != ADMIN_ID:
-
-        await update.message.reply_text(
-            "⛔ You are not allowed to use /add."
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
         )
-
-        return
-
-    context.user_data["add_step"] = "category"
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🇧🇩 Bangla",
-                callback_data="addcat_bangla"
-            ),
-            InlineKeyboardButton(
-                "🇬🇧 English",
-                callback_data="addcat_english"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔥 Viral",
-                callback_data="addcat_viral"
-            ),
-            InlineKeyboardButton(
-                "📈 Trending",
-                callback_data="addcat_trending"
-            )
-        ]
-    ])
-
-    await update.message.reply_text(
-        "➕ Add New Video\n\n"
-        "Choose category:",
-        reply_markup=keyboard
-    )
-
-
-# =========================================================
-# ADMIN CATEGORY
-# =========================================================
-
-async def admin_category_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if query.from_user.id != ADMIN_ID:
-
-        await query.message.reply_text(
-            "⛔ Not allowed."
-        )
-
-        return
-
-    category = query.data.replace(
-        "addcat_",
-        "",
-        1
-    )
-
-    context.user_data["add_category"] = category
-
-    context.user_data["add_step"] = "title"
-
-    await query.message.reply_text(
-        "1️⃣ Send the video title:"
-    )
-
-
-# =========================================================
-# ADMIN MESSAGE HANDLER
-# =========================================================
-
-async def admin_message_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if update.effective_user.id != ADMIN_ID:
-
-        return
-
-    step = context.user_data.get(
-        "add_step"
-    )
-
-    # =====================================================
-    # TITLE
-    # =====================================================
-
-    if step == "title":
-
-        if not update.message.text:
-
-            await update.message.reply_text(
-                "❌ Please send title as text."
-            )
-
-            return
-
-        context.user_data["add_title"] = (
-            update.message.text.strip()
-        )
-
-        context.user_data["add_step"] = (
-            "thumbnail"
-        )
-
-        await update.message.reply_text(
-            "2️⃣ Send thumbnail image.\n\n"
-            "If you don't want thumbnail, send /skip"
-        )
-
-        return
-
-    # =====================================================
-    # THUMBNAIL
-    # =====================================================
-
-    if step == "thumbnail":
-
-        if (
-            update.message.text
-            and update.message.text.strip().lower()
-            == "/skip"
-        ):
-
-            context.user_data["add_thumbnail"] = None
-
-            context.user_data["add_step"] = "video"
-
-            await update.message.reply_text(
-                "3️⃣ Now forward/send the video "
-                "from your private channel."
-            )
-
-            return
-
-        if update.message.photo:
-
-            context.user_data["add_thumbnail"] = (
-                update.message.photo[-1].file_id
-            )
-
-            context.user_data["add_step"] = "video"
-
-            await update.message.reply_text(
-                "3️⃣ Now forward/send the video "
-                "from your private channel."
-            )
-
-            return
-
-        await update.message.reply_text(
-            "❌ Send a photo or /skip."
-        )
-
-        return
-
-    # =====================================================
-    # VIDEO
-    # =====================================================
-
-    if step == "video":
-
-        if not update.message.video:
-
-            await update.message.reply_text(
-                "❌ Please send/forward a video."
-            )
-
-            return
-
-        context.user_data["add_video"] = (
-            update.message.video.file_id
-        )
-
-        context.user_data["add_step"] = "ad"
-
-        await update.message.reply_text(
-            "4️⃣ Send the Adsterra SmartLink URL.\n\n"
-            "Example:\n"
-            "https://example.com/xxxxx"
-        )
-
-        return
-
-    # =====================================================
-    # AD URL
-    # =====================================================
-
-    if step == "ad":
-
-        if not update.message.text:
-
-            await update.message.reply_text(
-                "❌ Send the Adsterra SmartLink URL."
-            )
-
-            return
-
-        ad_url = (
-            update.message.text.strip()
-        )
-
-        if not (
-            ad_url.startswith("http://")
-            or ad_url.startswith("https://")
-        ):
-
-            await update.message.reply_text(
-                "❌ Invalid URL."
-            )
-
-            return
-
-        category = context.user_data[
-            "add_category"
-        ]
-
-        title = context.user_data[
-            "add_title"
-        ]
-
-        thumbnail = context.user_data.get(
-            "add_thumbnail"
-        )
-
-        video = context.user_data[
-            "add_video"
-        ]
-
-        content_id = add_content(
-            category,
-            title,
-            thumbnail,
-            video,
-            ad_url
-        )
-
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            "✅ Video added successfully!\n\n"
-            f"🆔 ID: {content_id}\n"
-            f"🎬 {title}\n\n"
-            "Users will first see the advertisement "
-            "page and then the video player."
-        )
-
-        return
-
-
-# =========================================================
-# HELP
-# =========================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if update.effective_user.id == ADMIN_ID:
-
-        await update.message.reply_text(
-            "🎬 StreamX Admin\n\n"
-            "/start - User menu\n"
-            "/add - Add video"
-        )
-
-    else:
-
-        await update.message.reply_text(
-            "Use /start to browse videos."
-        )
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
 
     init_db()
 
-    if BOT_TOKEN == "PASTE_YOUR_NEW_BOT_TOKEN_HERE":
+    application = Application.builder().token(
+        BOT_TOKEN
+    ).build()
 
-        print(
-            "ERROR: Put your new BotFather token "
-            "inside BOT_TOKEN."
-        )
-
-        return
-
-    print("================================")
-    print("STREAMX BOT STARTING")
-    print("================================")
-
-    application = (
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
+    # /start
     application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+        CommandHandler("start", start)
     )
 
-    application.add_handler(
-        CommandHandler(
-            "add",
-            add_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_command
-        )
-    )
-
+    # category
     application.add_handler(
         CallbackQueryHandler(
             category_callback,
-            pattern=r"^cat_(bangla|english|viral|trending)$"
+            pattern=r"^cat_"
         )
     )
 
+    # open video
     application.add_handler(
         CallbackQueryHandler(
             open_video,
-            pattern=r"^open_video_\d+$"
+            pattern=r"^open_\d+$"
         )
     )
 
-    application.add_handler(
-        CallbackQueryHandler(
-            admin_category_callback,
-            pattern=r"^addcat_(bangla|english|viral|trending)$"
-        )
+    # add conversation
+    add_conversation = ConversationHandler(
+        entry_points=[
+            CommandHandler("add", add_command)
+        ],
+
+        states={
+            ADD_CATEGORY: [
+                CallbackQueryHandler(
+                    add_category,
+                    pattern=r"^addcat_"
+                )
+            ],
+
+            ADD_TITLE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    add_title
+                )
+            ],
+
+            ADD_THUMBNAIL: [
+                MessageHandler(
+                    filters.PHOTO | filters.TEXT,
+                    add_thumbnail
+                )
+            ],
+
+            ADD_VIDEO: [
+                MessageHandler(
+                    filters.VIDEO,
+                    add_video
+                )
+            ],
+
+            ADD_AD_URL: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    add_ad_url
+                )
+            ],
+        },
+
+        fallbacks=[
+            CommandHandler("cancel", cancel_add)
+        ]
     )
 
-    application.add_handler(
-        MessageHandler(
-            filters.ALL & ~filters.COMMAND,
-            admin_message_handler
-        )
+    application.add_handler(add_conversation)
+
+    print("================================")
+    print("STREAMX BOT + WEBSITE STARTING")
+    print("================================")
+
+    application.run_polling(
+        drop_pending_updates=True
     )
 
-    print("BOT CONNECTED")
-    print("Username: @streamx24bot")
-    print("Waiting for messages...")
 
-    application.run_polling()
-
+# =====================================================
+# MAIN
+# =====================================================
 
 if __name__ == "__main__":
-    main()
+
+    # Flask website runs in background thread
+    web_thread = threading.Thread(
+        target=start_web_server,
+        daemon=True
+    )
+
+    web_thread.start()
+
+    # Telegram bot runs in main thread
+    run_bot()
