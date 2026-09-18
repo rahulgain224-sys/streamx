@@ -24,7 +24,7 @@ DATABASE = "content.db"
 # Hosting করার পর এখানে তোমার public HTTPS URL বসাবে
 # Example:
 # WEB_APP_URL = "https://streamx-video.onrender.com"
-WEB_APP_URL = "https://YOUR-DOMAIN-HERE"
+WEB_APP_URL = "https://streamx-u24j.onrender.com"
 
 
 CATEGORIES = {
