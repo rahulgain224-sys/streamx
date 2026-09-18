@@ -7,1149 +7,603 @@ import requests
 
 from flask import (
     Flask,
-    request,
-    render_template_string,
     redirect,
-    abort,
+    request,
     Response,
+    abort,
 )
 
-
-# =========================================================
-# SETTINGS
-# =========================================================
-
-DATABASE = "content.db"
-
-BOT_TOKEN = "8352992151:AAE2Y6soETifFAjizXsPBblj2vff00-exkQ"
-
-BOT_USERNAME = "streamx24bot"
-
-PORT = int(
-    os.environ.get(
-        "PORT",
-        "8080"
-    )
-)
-
-# Token কতক্ষণ valid থাকবে
-TOKEN_LIFETIME = 30 * 60
-
-# Ad button click করার পর minimum wait
-AD_WAIT_SECONDS = 8
-
+# =====================================================
+# CONFIG
+# =====================================================
 
 app = Flask(__name__)
 
+DATABASE = "content.db"
 
-# =========================================================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+
+BOT_USERNAME = "streamx24bot"
+
+TOKEN_LIFETIME = 30 * 60
+
+AD_WAIT_SECONDS = 8
+
+# =====================================================
 # DATABASE
-# =========================================================
+# =====================================================
 
-def db():
+def db_connect():
 
     conn = sqlite3.connect(
-        DATABASE
+        DATABASE,
+        timeout=30
     )
 
-    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "PRAGMA journal_mode=WAL"
+    )
 
     return conn
 
 
-def ensure_token_table():
+def init_db():
 
-    conn = db()
+    conn = db_connect()
 
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS ad_tokens (
-
-            token TEXT PRIMARY KEY,
-
-            content_id INTEGER NOT NULL,
-
-            ad_clicked INTEGER DEFAULT 0,
-
-            unlocked INTEGER DEFAULT 0,
-
-            used INTEGER DEFAULT 0,
-
-            created_at REAL NOT NULL,
-
-            expires_at REAL NOT NULL
+        CREATE TABLE IF NOT EXISTS content (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            thumbnail_file_id TEXT,
+            video_file_id TEXT NOT NULL,
+            ad_url TEXT NOT NULL,
+            created_at INTEGER NOT NULL
         )
     """)
 
-    columns = [
-        row["name"]
-        for row in conn.execute(
-            "PRAGMA table_info(ad_tokens)"
-        ).fetchall()
-    ]
-
-    if "used" not in columns:
-
-        conn.execute(
-            """
-            ALTER TABLE ad_tokens
-            ADD COLUMN used INTEGER DEFAULT 0
-            """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS access_tokens (
+            token TEXT PRIMARY KEY,
+            content_id INTEGER NOT NULL,
+            ad_clicked INTEGER DEFAULT 0,
+            used INTEGER DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            unlocked_at INTEGER DEFAULT 0
         )
+    """)
 
     conn.commit()
-
     conn.close()
 
 
+# =====================================================
+# GET CONTENT
+# =====================================================
+
 def get_content(content_id):
 
-    conn = db()
+    conn = db_connect()
 
-    row = conn.execute(
-        """
-        SELECT *
-        FROM contents
+    row = conn.execute("""
+        SELECT
+            id,
+            title,
+            video_file_id,
+            ad_url
+        FROM content
         WHERE id = ?
-        """,
-        (content_id,)
-    ).fetchone()
+    """, (content_id,)).fetchone()
 
     conn.close()
 
     return row
 
 
+# =====================================================
+# CREATE ACCESS TOKEN
+# =====================================================
+
 def create_token(content_id):
 
-    token = secrets.token_urlsafe(
-        32
-    )
+    token = secrets.token_urlsafe(32)
 
-    now = time.time()
+    conn = db_connect()
 
-    expires = (
-        now
-        + TOKEN_LIFETIME
-    )
-
-    conn = db()
-
-    conn.execute(
-        """
-        INSERT INTO ad_tokens
+    conn.execute("""
+        INSERT INTO access_tokens
         (
             token,
             content_id,
             ad_clicked,
-            unlocked,
             used,
             created_at,
-            expires_at
+            unlocked_at
         )
-
-        VALUES (?, ?, 0, 0, 0, ?, ?)
-        """,
-        (
-            token,
-            content_id,
-            now,
-            expires
-        )
-    )
+        VALUES (?, ?, 0, 0, ?, 0)
+    """, (
+        token,
+        content_id,
+        int(time.time())
+    ))
 
     conn.commit()
-
     conn.close()
 
     return token
 
 
+# =====================================================
+# CHECK TOKEN
+# =====================================================
+
 def get_token(token):
 
-    conn = db()
+    conn = db_connect()
 
-    row = conn.execute(
-        """
-        SELECT *
-        FROM ad_tokens
+    row = conn.execute("""
+        SELECT
+            token,
+            content_id,
+            ad_clicked,
+            used,
+            created_at,
+            unlocked_at
+        FROM access_tokens
         WHERE token = ?
-        """,
-        (token,)
-    ).fetchone()
+    """, (token,)).fetchone()
 
     conn.close()
 
     return row
 
 
-def mark_ad_clicked(token):
+# =====================================================
+# WATCH PAGE
+# =====================================================
 
-    conn = db()
+@app.route("/watch/<int:content_id>")
+def watch(content_id):
 
-    conn.execute(
-        """
-        UPDATE ad_tokens
-        SET ad_clicked = 1
-        WHERE token = ?
-        """,
-        (token,)
-    )
+    content = get_content(content_id)
 
-    conn.commit()
+    if not content:
+        return "Video not found", 404
 
-    conn.close()
+    _, title, _, ad_url = content
 
+    if not ad_url:
+        return "Advertisement not configured.", 400
 
-def unlock_token(token):
+    token = create_token(content_id)
 
-    conn = db()
-
-    conn.execute(
-        """
-        UPDATE ad_tokens
-        SET unlocked = 1
-        WHERE token = ?
-        """,
-        (token,)
-    )
-
-    conn.commit()
-
-    conn.close()
-
-
-def is_expired(row):
-
-    if not row:
-        return True
-
-    return (
-        float(row["expires_at"])
-        < time.time()
-    )
-
-
-# =========================================================
-# ADVERTISEMENT PAGE
-# =========================================================
-
-AD_PAGE = """
-
+    return f"""
 <!DOCTYPE html>
-
 <html>
-
 <head>
-
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-<meta
-    name="viewport"
-    content="width=device-width,initial-scale=1"
->
-
-<title>
-Watch Ad - StreamX
-</title>
-
+<title>{title}</title>
 
 <style>
 
-body {
-
-    margin: 0;
-
-    min-height: 100vh;
-
-    display: flex;
-
-    justify-content: center;
-
-    align-items: center;
-
-    background: #101114;
-
-    color: white;
-
-    font-family: Arial, sans-serif;
-
-}
-
-
-.box {
-
-    width: min(92%, 460px);
-
-    background: #1b1d22;
-
-    padding: 28px;
-
-    border-radius: 18px;
-
-    text-align: center;
-
-    box-sizing: border-box;
-
-}
-
-
-h2 {
-
-    margin-top: 0;
-
-}
-
-
-.title {
-
-    color: #ddd;
-
-    margin-bottom: 22px;
-
-}
-
-
-.btn {
-
-    display: block;
-
-    width: 100%;
-
-    padding: 15px;
-
-    margin-top: 12px;
-
-    border: 0;
-
-    border-radius: 10px;
-
-    font-size: 16px;
-
-    font-weight: bold;
-
-    text-decoration: none;
-
-    box-sizing: border-box;
-
-    cursor: pointer;
-
-}
-
-
-.ad {
-
-    background: #ff8a00;
-
-    color: #111;
-
-}
-
-
-.continue {
-
-    background: #28a745;
-
-    color: white;
-
-}
-
-
-.disabled {
-
-    background: #555;
-
-    color: #bbb;
-
-    pointer-events: none;
-
-}
-
-
-#status {
-
-    margin-top: 16px;
-
-    color: #ffcf66;
-
-    min-height: 20px;
-
-}
-
-
-.small {
-
-    color: #999;
-
-    font-size: 13px;
-
-    margin-top: 18px;
-
-    line-height: 1.5;
-
-}
+body {{
+    background:#111;
+    color:white;
+    font-family:Arial,sans-serif;
+    text-align:center;
+    padding:30px;
+}}
+
+.box {{
+    max-width:500px;
+    margin:auto;
+    background:#1d1d1d;
+    padding:30px;
+    border-radius:15px;
+}}
+
+button {{
+    border:0;
+    border-radius:10px;
+    padding:15px 25px;
+    font-size:17px;
+    cursor:pointer;
+}}
+
+.ad {{
+    background:#ff9800;
+    color:#000;
+}}
+
+.continue {{
+    background:#28a745;
+    color:white;
+    opacity:.4;
+    pointer-events:none;
+}}
+
+.continue.enabled {{
+    opacity:1;
+    pointer-events:auto;
+}}
+
+#timer {{
+    margin-top:20px;
+    color:#aaa;
+}}
 
 </style>
-
 </head>
-
 
 <body>
 
-
 <div class="box">
 
-<h2>
-📢 Advertisement
-</h2>
+<h2>🎬 {title}</h2>
 
+<p>Video দেখতে advertisement step complete করো.</p>
 
-<div class="title">
+<a
+    href="/ad/{token}"
+    target="_blank"
+    onclick="startTimer()"
+>
+    <button class="ad">
+        📢 WATCH AD
+    </button>
+</a>
 
-🎬 {{ title }}
-
-</div>
-
-
-<p>
-
-Advertisement খুলে কিছুক্ষণ অপেক্ষা করুন।
-
+<p id="timer">
+    প্রথমে WATCH AD চাপো
 </p>
 
-
-<a
-    class="btn ad"
-    href="/ad/{{ token }}"
-    target="_blank"
-    rel="noopener noreferrer"
-    onclick="startAdTimer()"
->
-
-📢 WATCH AD
-
-</a>
-
-
-<a
-    id="continueBtn"
-    class="btn disabled"
-    href="/unlock/{{ token }}"
->
-
-🔒 Continue
-
-</a>
-
-
-<div id="status">
-
-WATCH AD চাপুন
-
-</div>
-
-
-<div class="small">
-
-WATCH AD চাপলে Advertisement নতুন tab-এ খুলবে।
 <br>
-তারপর এই tab-এ ফিরে এসে Continue চাপুন।
+
+<a id="continueLink" href="/unlock/{token}">
+    <button id="continueBtn" class="continue">
+        ▶️ CONTINUE
+    </button>
+</a>
 
 </div>
-
-
-</div>
-
 
 <script>
 
-let allowContinue = false;
+let started = false;
 
-let timerStarted = false;
+function startTimer() {{
 
-let remaining = {{ wait_seconds }};
+    if (started) return;
 
+    started = true;
 
-function startAdTimer() {
+    let seconds = {AD_WAIT_SECONDS};
 
-    if (timerStarted) {
+    const timer = document.getElementById("timer");
+    const btn = document.getElementById("continueBtn");
 
-        return;
+    timer.innerText =
+        "Please wait " + seconds + " seconds...";
 
-    }
+    const interval = setInterval(function() {{
 
+        seconds--;
 
-    timerStarted = true;
+        if (seconds > 0) {{
 
+            timer.innerText =
+                "Please wait " + seconds + " seconds...";
 
-    document.getElementById(
-        "status"
-    ).innerText =
-        "Advertisement opened. Please wait "
-        + remaining
-        + " seconds...";
+        }} else {{
 
+            clearInterval(interval);
 
-    const timer = setInterval(
-        function() {
+            timer.innerText =
+                "✅ Continue button unlocked";
 
-            remaining--;
+            btn.classList.add("enabled");
 
+        }}
 
-            if (remaining > 0) {
-
-                document.getElementById(
-                    "status"
-                ).innerText =
-                    "Continue available in "
-                    + remaining
-                    + " seconds...";
-
-            }
-
-            else {
-
-                clearInterval(timer);
-
-                allowContinue = true;
-
-
-                const btn =
-                    document.getElementById(
-                        "continueBtn"
-                    );
-
-
-                btn.classList.remove(
-                    "disabled"
-                );
-
-
-                btn.style.pointerEvents =
-                    "auto";
-
-
-                btn.style.background =
-                    "#28a745";
-
-
-                document.getElementById(
-                    "status"
-                ).innerText =
-                    "✅ You can continue now.";
-
-            }
-
-        },
-        1000
-    );
-
-}
-
-
-document
-    .getElementById("continueBtn")
-    .addEventListener(
-        "click",
-        function(event) {
-
-            if (!allowContinue) {
-
-                event.preventDefault();
-
-                return false;
-
-            }
-
-        }
-    );
+    }}, 1000);
+}}
 
 </script>
 
-
 </body>
-
 </html>
-
 """
 
 
-# =========================================================
-# UNLOCK PAGE
-# =========================================================
-
-DONE_PAGE = """
-
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width,initial-scale=1"
->
-
-<title>
-StreamX
-</title>
-
-
-<style>
-
-body {
-
-    margin: 0;
-
-    min-height: 100vh;
-
-    display: flex;
-
-    align-items: center;
-
-    justify-content: center;
-
-    background: #101114;
-
-    color: white;
-
-    font-family: Arial, sans-serif;
-
-}
-
-
-.box {
-
-    width: min(92%, 460px);
-
-    background: #1b1d22;
-
-    padding: 28px;
-
-    border-radius: 18px;
-
-    text-align: center;
-
-}
-
-
-a {
-
-    display: block;
-
-    margin-top: 20px;
-
-    padding: 15px;
-
-    border-radius: 10px;
-
-    background: #2481cc;
-
-    color: white;
-
-    text-decoration: none;
-
-    font-weight: bold;
-
-}
-
-
-.small {
-
-    color: #aaa;
-
-    margin-top: 15px;
-
-    font-size: 13px;
-
-}
-
-</style>
-
-</head>
-
-
-<body>
-
-
-<div class="box">
-
-
-<h2>
-
-✅ Advertisement Complete
-
-</h2>
-
-
-<p>
-
-এখন ভিডিওটি খুলুন।
-
-</p>
-
-
-<a href="{{ telegram_url }}">
-
-📲 OPEN VIDEO IN TELEGRAM
-
-</a>
-
-
-<div class="small">
-
-Telegram খুলে ভিডিওটি Open করুন।
-
-</div>
-
-
-</div>
-
-
-</body>
-
-</html>
-
-"""
-
-
-# =========================================================
-# VIDEO PAGE
-# =========================================================
-
-VIDEO_PAGE = """
-
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width,initial-scale=1"
->
-
-<title>
-{{ title }} - StreamX
-</title>
-
-
-<style>
-
-body {
-
-    margin: 0;
-
-    min-height: 100vh;
-
-    background: #08090b;
-
-    color: white;
-
-    font-family: Arial, sans-serif;
-
-}
-
-
-.wrap {
-
-    max-width: 900px;
-
-    margin: 0 auto;
-
-    padding: 18px;
-
-    box-sizing: border-box;
-
-}
-
-
-h2 {
-
-    font-size: 20px;
-
-    margin: 5px 0 16px;
-
-}
-
-
-.player {
-
-    width: 100%;
-
-    background: #000;
-
-    border-radius: 14px;
-
-    overflow: hidden;
-
-}
-
-
-video {
-
-    width: 100%;
-
-    max-height: 75vh;
-
-    display: block;
-
-    background: #000;
-
-}
-
-
-.info {
-
-    margin-top: 16px;
-
-    padding: 16px;
-
-    background: #15171b;
-
-    border-radius: 12px;
-
-}
-
-
-.notice {
-
-    color: #999;
-
-    font-size: 13px;
-
-    line-height: 1.5;
-
-    margin-top: 8px;
-
-}
-
-
-.back {
-
-    display: inline-block;
-
-    margin-top: 14px;
-
-    color: #7dbbff;
-
-    text-decoration: none;
-
-}
-
-</style>
-
-</head>
-
-
-<body>
-
-
-<div class="wrap">
-
-
-<h2>
-
-🎬 {{ title }}
-
-</h2>
-
-
-<div class="player">
-
-
-<video
-    controls
-    playsinline
-    preload="metadata"
-    src="/stream/{{ token }}"
->
-
-</video>
-
-
-</div>
-
-
-<div class="info">
-
-▶️ StreamX Video Player
-
-<div class="notice">
-
-শুধু নির্বাচিত ভিডিওটি এখানে দেখানো হচ্ছে।
-
-</div>
-
-</div>
-
-
-<a
-    class="back"
-    href="https://t.me/{{ bot_username }}"
->
-
-← Back to Telegram
-
-</a>
-
-
-</div>
-
-
-</body>
-
-</html>
-
-"""
-
-
-# =========================================================
-# HOME
-# =========================================================
-
-@app.route("/")
-def home():
-
-    return """
-
-    <h2>
-    StreamX is running ✅
-    </h2>
-
-    <p>
-    Telegram Bot: @streamx24bot
-    </p>
-
-    """
-
-
-# =========================================================
-# WATCH / AD PAGE
-# =========================================================
-
-@app.route(
-    "/watch/<int:content_id>"
-)
-def watch(content_id):
-
-    ensure_token_table()
-
-    content = get_content(
-        content_id
-    )
-
-    if not content:
-
-        abort(404)
-
-    ad_url = (
-        content["ad_url"] or ""
-    ).strip()
-
-    if not ad_url:
-
-        return (
-            "Advertisement is not configured.",
-            400
-        )
-
-    token = create_token(
-        content_id
-    )
-
-    return render_template_string(
-        AD_PAGE,
-        title=content["title"],
-        token=token,
-        wait_seconds=AD_WAIT_SECONDS
-    )
-
-
-# =========================================================
+# =====================================================
 # AD REDIRECT
-# =========================================================
+# =====================================================
 
-@app.route(
-    "/ad/<token>"
-)
+@app.route("/ad/<token>")
 def ad_redirect(token):
 
-    ensure_token_table()
-
     row = get_token(token)
 
     if not row:
+        return "Invalid or expired link.", 404
 
-        return (
-            "Invalid session.",
-            404
+    (
+        token_value,
+        content_id,
+        ad_clicked,
+        used,
+        created_at,
+        unlocked_at
+    ) = row
+
+    if time.time() - created_at > TOKEN_LIFETIME:
+
+        conn = db_connect()
+
+        conn.execute(
+            "DELETE FROM access_tokens WHERE token = ?",
+            (token,)
         )
 
-    if is_expired(row):
+        conn.commit()
+        conn.close()
 
-        return (
-            "Advertisement session expired.",
-            410
-        )
+        return "⏰ Link expired.", 410
 
-    content = get_content(
-        row["content_id"]
-    )
+    content = get_content(content_id)
 
     if not content:
+        return "Video not found.", 404
 
-        abort(404)
+    ad_url = content[3]
 
-    ad_url = (
-        content["ad_url"] or ""
-    ).strip()
+    # Record that user clicked our WATCH AD button
+    conn = db_connect()
 
-    if not ad_url:
+    conn.execute("""
+        UPDATE access_tokens
+        SET ad_clicked = 1
+        WHERE token = ?
+    """, (token,))
 
-        return (
-            "Advertisement URL missing.",
-            400
-        )
+    conn.commit()
+    conn.close()
 
-    # WATCH AD button clicked
-    mark_ad_clicked(token)
-
-    return redirect(
-        ad_url
-    )
+    return redirect(ad_url)
 
 
-# =========================================================
+# =====================================================
 # UNLOCK
-# =========================================================
+# =====================================================
 
-@app.route(
-    "/unlock/<token>"
-)
+@app.route("/unlock/<token>")
 def unlock(token):
-
-    ensure_token_table()
 
     row = get_token(token)
 
     if not row:
+        return "Invalid or expired link.", 404
 
-        return (
-            "Invalid session.",
-            404
-        )
+    (
+        token_value,
+        content_id,
+        ad_clicked,
+        used,
+        created_at,
+        unlocked_at
+    ) = row
 
-    if is_expired(row):
+    if time.time() - created_at > TOKEN_LIFETIME:
+        return "⏰ Link expired.", 410
 
-        return (
-            "Session expired.",
-            410
-        )
+    if not ad_clicked:
+        return """
+        <html>
+        <body style="background:#111;color:white;text-align:center;padding:50px;font-family:Arial;">
+        <h2>⚠️ Advertisement step incomplete</h2>
+        <p>Please go back and click WATCH AD first.</p>
+        </body>
+        </html>
+        """, 403
 
-    if not row["ad_clicked"]:
-
-        return (
-            "❌ Please click WATCH AD first.",
-            403
-        )
-
-    unlock_token(
-        token
-    )
-
+    # Generate Telegram deep link
     telegram_url = (
         f"https://t.me/{BOT_USERNAME}"
         f"?start=video_{token}"
     )
 
-    return render_template_string(
-        DONE_PAGE,
-        telegram_url=telegram_url
-    )
+    return f"""
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1.0">
+
+<title>Video Unlocked</title>
+
+<style>
+
+body {{
+    background:#111;
+    color:white;
+    text-align:center;
+    font-family:Arial;
+    padding:40px;
+}}
+
+.box {{
+    max-width:500px;
+    margin:auto;
+    background:#1d1d1d;
+    padding:30px;
+    border-radius:15px;
+}}
+
+button {{
+    background:#28a745;
+    color:white;
+    border:0;
+    padding:15px 25px;
+    border-radius:10px;
+    font-size:18px;
+}}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="box">
+
+<h2>✅ Video Unlocked</h2>
+
+<p>Telegram-এ ফিরে গিয়ে video খুলতে নিচের button চাপো.</p>
+
+<a href="{telegram_url}">
+<button>
+📲 CONTINUE TO VIDEO
+</button>
+</a>
+
+</div>
+
+</body>
+
+</html>
+"""
 
 
-# =========================================================
+# =====================================================
 # VIDEO PAGE
-# =========================================================
+# =====================================================
 
-@app.route(
-    "/video/<token>"
-)
+@app.route("/video/<token>")
 def video_page(token):
-
-    ensure_token_table()
 
     row = get_token(token)
 
     if not row:
+        return "Invalid or expired link.", 404
 
-        return (
-            "Invalid video session.",
-            404
-        )
+    (
+        token_value,
+        content_id,
+        ad_clicked,
+        used,
+        created_at,
+        unlocked_at
+    ) = row
 
-    if is_expired(row):
+    if time.time() - created_at > TOKEN_LIFETIME:
+        return "⏰ Video link expired.", 410
 
-        return (
-            "Video session expired.",
-            410
-        )
+    if not ad_clicked:
+        return "Advertisement step incomplete.", 403
 
-    if not row["unlocked"]:
-
-        return (
-            "🔒 Advertisement step required.",
-            403
-        )
-
-    content = get_content(
-        row["content_id"]
-    )
+    content = get_content(content_id)
 
     if not content:
+        return "Video not found.", 404
 
-        abort(404)
+    title = content[1]
 
-    return render_template_string(
-        VIDEO_PAGE,
-        title=content["title"],
-        token=token,
-        bot_username=BOT_USERNAME
+    stream_url = f"/stream/{token}"
+
+    return f"""
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1.0">
+
+<title>{title}</title>
+
+<style>
+
+body {{
+    margin:0;
+    background:#000;
+    color:white;
+    font-family:Arial;
+}}
+
+.container {{
+    max-width:900px;
+    margin:auto;
+    padding:20px;
+}}
+
+video {{
+    width:100%;
+    max-height:80vh;
+    background:#000;
+}}
+
+h2 {{
+    font-size:20px;
+}}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h2>🎬 {title}</h2>
+
+<video
+    controls
+    playsinline
+    preload="metadata"
+>
+    <source
+        src="{stream_url}"
+        type="video/mp4"
+    >
+
+    Your browser does not support video playback.
+
+</video>
+
+</div>
+
+</body>
+
+</html>
+"""
+
+
+# =====================================================
+# TELEGRAM FILE INFO
+# =====================================================
+
+def telegram_get_file(file_id):
+
+    if not BOT_TOKEN:
+        raise Exception("BOT_TOKEN is missing")
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{BOT_TOKEN}/getFile"
     )
 
-
-# =========================================================
-# GET TELEGRAM FILE URL
-# =========================================================
-
-def telegram_file_url(
-    file_id
-):
-
-    if (
-        BOT_TOKEN
-        == "PASTE_YOUR_NEW_BOT_TOKEN_HERE"
-    ):
-
-        raise RuntimeError(
-            "BOT_TOKEN is not configured."
-        )
-
-    response = requests.post(
-
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/getFile",
-
-        json={
-            "file_id": file_id
-        },
-
+    response = requests.get(
+        url,
+        params={"file_id": file_id},
         timeout=30
     )
 
@@ -1158,177 +612,169 @@ def telegram_file_url(
     data = response.json()
 
     if not data.get("ok"):
-
-        raise RuntimeError(
-            data
+        raise Exception(
+            data.get("description", "Telegram API error")
         )
 
-    file_path = (
-        data["result"]["file_path"]
-    )
-
-    return (
-        f"https://api.telegram.org/"
-        f"file/bot{BOT_TOKEN}/"
-        f"{file_path}"
-    )
+    return data["result"]["file_path"]
 
 
-# =========================================================
-# VIDEO STREAM
-# =========================================================
+# =====================================================
+# STREAM TELEGRAM VIDEO
+# =====================================================
 
-@app.route(
-    "/stream/<token>"
-)
+@app.route("/stream/<token>")
 def stream_video(token):
-
-    ensure_token_table()
 
     row = get_token(token)
 
     if not row:
+        abort(404)
 
-        return (
-            "Invalid session.",
-            404
-        )
+    (
+        token_value,
+        content_id,
+        ad_clicked,
+        used,
+        created_at,
+        unlocked_at
+    ) = row
 
-    if is_expired(row):
+    if time.time() - created_at > TOKEN_LIFETIME:
+        abort(410)
 
-        return (
-            "Video session expired.",
-            410
-        )
+    if not ad_clicked:
+        abort(403)
 
-    if not row["unlocked"]:
-
-        return (
-            "Video locked.",
-            403
-        )
-
-    content = get_content(
-        row["content_id"]
-    )
+    content = get_content(content_id)
 
     if not content:
-
         abort(404)
+
+    video_file_id = content[2]
 
     try:
 
-        telegram_url = telegram_file_url(
-            content["video_file_id"]
+        file_path = telegram_get_file(
+            video_file_id
         )
 
-    except Exception as error:
-
-        print(
-            "Telegram getFile error:",
-            error
-        )
+    except Exception as e:
 
         return (
-            "Could not prepare video.",
-            502
+            f"Telegram file error: {str(e)}",
+            500
         )
+
+    telegram_file_url = (
+        f"https://api.telegram.org/file/bot"
+        f"{BOT_TOKEN}/{file_path}"
+    )
 
     headers = {}
 
-    if request.headers.get(
-        "Range"
-    ):
+    # Browser video player sends Range requests
+    range_header = request.headers.get("Range")
 
-        headers["Range"] = (
-            request.headers["Range"]
-        )
+    if range_header:
+        headers["Range"] = range_header
 
     try:
 
-        upstream = requests.get(
-
-            telegram_url,
-
+        r = requests.get(
+            telegram_file_url,
             headers=headers,
-
             stream=True,
-
-            timeout=(
-                15,
-                120
-            )
+            timeout=60
         )
 
-    except Exception as error:
-
-        print(
-            "Video stream error:",
-            error
-        )
+    except Exception as e:
 
         return (
-            "Video stream failed.",
-            502
+            f"Stream error: {str(e)}",
+            500
         )
 
     response_headers = {}
 
-    for key in [
-
+    for header in [
         "Content-Type",
         "Content-Length",
         "Content-Range",
         "Accept-Ranges",
-        "ETag",
-        "Last-Modified",
-
     ]:
 
-        value = (
-            upstream.headers.get(key)
-        )
+        if header in r.headers:
+            response_headers[header] = r.headers[header]
 
-        if value:
+    response_headers["Cache-Control"] = "no-store"
 
-            response_headers[key] = value
+    def generate():
 
-    response_headers[
-        "Accept-Ranges"
-    ] = "bytes"
+        try:
+
+            for chunk in r.iter_content(
+                chunk_size=1024 * 1024
+            ):
+
+                if chunk:
+                    yield chunk
+
+        finally:
+
+            r.close()
 
     return Response(
-
-        upstream.iter_content(
-            chunk_size=1024 * 256
-        ),
-
-        status=upstream.status_code,
-
-        headers=response_headers,
-
-        direct_passthrough=True
+        generate(),
+        status=r.status_code,
+        headers=response_headers
     )
 
 
-# =========================================================
-# MAIN
-# =========================================================
+# =====================================================
+# HEALTH CHECK
+# =====================================================
+
+@app.route("/")
+def home():
+
+    return """
+    <html>
+    <head>
+        <title>StreamX</title>
+    </head>
+
+    <body style="
+        background:#111;
+        color:white;
+        text-align:center;
+        font-family:Arial;
+        padding:50px;
+    ">
+
+        <h1>🎬 StreamX</h1>
+
+        <p>Website is running successfully.</p>
+
+    </body>
+    </html>
+    """
+
+
+# =====================================================
+# INIT
+# =====================================================
+
+init_db()
+
 
 if __name__ == "__main__":
 
-    ensure_token_table()
-
-    print(
-        f"StreamX web server running "
-        f"on port {PORT}"
+    port = int(
+        os.environ.get("PORT", "8080")
     )
 
     app.run(
-
         host="0.0.0.0",
-
-        port=PORT,
-
-        debug=False
+        port=port
     )
