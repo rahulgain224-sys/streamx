@@ -106,6 +106,10 @@ def category_keyboard():
     ])
 
 
+# =====================================================
+# BACK BUTTON
+# =====================================================
+
 def back_to_categories_keyboard():
     return InlineKeyboardMarkup([
         [
@@ -116,6 +120,7 @@ def back_to_categories_keyboard():
         ]
     ])
 
+
 async def back_to_categories(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -124,11 +129,13 @@ async def back_to_categories(
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    # নতুন message পাঠাবে, পুরোনো message edit করবে না
+    await query.message.reply_text(
         "🎬 Welcome to StreamX!\n\n"
         "একটি category নির্বাচন করো:",
         reply_markup=category_keyboard()
     )
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -268,18 +275,24 @@ async def category_callback(
         return
 
     await query.edit_message_text(
-    f"{CATEGORIES[category]}\n\n"
-    "নিচের video-গুলো থেকে একটি নির্বাচন করো:",
-    reply_markup=back_to_categories_keyboard()
+        f"{CATEGORIES[category]}\n\n"
+        "নিচের video-গুলো থেকে একটি নির্বাচন করো:"
     )
 
     for content_id, title, thumbnail in rows:
 
+        # OPEN VIDEO + BACK
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
                     "▶️ OPEN VIDEO",
                     callback_data=f"open_{content_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data="back_categories"
                 )
             ]
         ])
@@ -358,19 +371,26 @@ async def open_video(
         + f"/watch/{content_id}"
     )
 
+    # WATCH AD + BACK
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "📢 WATCH AD & UNLOCK",
                 url=watch_url
             )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data="back_categories"
+            )
         ]
     ])
 
     await query.message.reply_text(
         f"🎬 {title}\n\n"
-        "Video দেখতে আগে নিচের button চাপো।\n"
-        "Advertisement page খুলবে।",
+        "Video দেখতে আগে নিচের button চাপো.\n"
+        "Advertisement page খুলবে.",
         reply_markup=keyboard
     )
 
@@ -577,8 +597,6 @@ async def cancel_add(
         "❌ Add process cancelled."
     )
 
-    return ConversationHandler.END
-
 
 # =====================================================
 # START FLASK SERVER
@@ -628,12 +646,12 @@ def run_bot():
         )
     )
 
-    # back to categories
+    # back to start/category menu
     application.add_handler(
-    CallbackQueryHandler(
-        back_to_categories,
-        pattern=r"^back_categories$"
-       )
+        CallbackQueryHandler(
+            back_to_categories,
+            pattern=r"^back_categories$"
+        )
     )
 
     # open video
